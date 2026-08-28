@@ -32,7 +32,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 DEFAULT_OSC_PORT = 53000
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
@@ -508,6 +508,22 @@ def fmt_hmsf(sec, fps=30):
     return "%s:%02d" % (fmt_hms(sec), f)
 
 
+def _flatten_cues(cue_list):
+    """Group キューを展開して実際に再生されうる末端のキューだけを順番通りに並べる。
+    (Group 自体は通常 dur=0 の入れ物で、cuestrip 表示上はノイズになるため省く。
+    runningOrPausedCues も末端キューを返すため、これで整合性が取れる。)"""
+    out = []
+    for cu in cue_list:
+        if not isinstance(cu, dict):
+            continue
+        children = cu.get("cues")
+        if isinstance(children, list) and children:
+            out.extend(_flatten_cues(children))
+        else:
+            out.append(cu)
+    return out
+
+
 def parse_targets(text, default_port=DEFAULT_OSC_PORT):
     out = []
     for chunk in re.split(r"[,\s]+", str(text or "")):
@@ -608,11 +624,14 @@ class Monitor(threading.Thread):
     def scan_lists(self):
         c = self.client
         ws = c.workspace
-        raw = c.call("/workspace/%s/cueLists/shallow" % ws) or []
+        # 非 shallow: Group キューの中身(子キュー)も含めて取得する。
+        # shallow だと Group の中身が一切返らず、ショー全体を1つの Group に
+        # まとめている構成だと「キューが1つも無い」ように見えてしまう。
+        raw = c.call("/workspace/%s/cueLists" % ws) or []
         lists = []
         for cl in raw if isinstance(raw, list) else []:
             cues = []
-            for cu in (cl.get("cues") or []):
+            for cu in _flatten_cues(cl.get("cues") or []):
                 cues.append({"id": cu.get("uniqueID"), "number": cu.get("number") or "",
                              "name": cu.get("name") or "", "type": cu.get("type") or "",
                              "color": cu.get("colorName") or "none", "dur": 0.0})
@@ -1450,7 +1469,7 @@ class DemoQLab(threading.Thread):
             return "ok"
         if addr == "/alwaysReply":
             return None
-        if addr.endswith("/cueLists/shallow"):
+        if addr.endswith("/cueLists/shallow") or addr.endswith("/cueLists"):
             return [{"uniqueID": "list1", "number": "", "listName": "Main Cue List",
                      "type": "Cue List", "colorName": "none", "name": "Main Cue List",
                      "cues": [{"uniqueID": c["id"], "number": c["number"], "name": c["name"],
@@ -1850,10 +1869,10 @@ def main():
             run = c.call("/workspace/%s/runningOrPausedCues/shallow" % c.workspace) or []
             print("再生中のキュー: %d" % len(run))
 
-            raw_cl = c.call_raw("/workspace/%s/cueLists/shallow" % c.workspace)
+            raw_cl = c.call_raw("/workspace/%s/cueLists" % c.workspace)
             status = raw_cl.get("status") if isinstance(raw_cl, dict) else None
             if status not in (None, "ok"):
-                print("\ncueLists/shallow への応答: status=%s" % status)
+                print("\ncueLists への応答: status=%s" % status)
                 print("  生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
                 print("→ QLab側でこのリクエストが denied/error になっています。")
                 print("  Workspace Settings › Network › OSC Access で、使っている")
@@ -1861,15 +1880,13 @@ def main():
             else:
                 data = raw_cl.get("data") if isinstance(raw_cl, dict) else raw_cl
                 lists = data if isinstance(data, list) else []
-                total_cues = sum(len(cl.get("cues") or []) for cl in lists if isinstance(cl, dict))
-                print("\nキューリスト: %d件 / 直下のキュー数(合計): %d" % (len(lists), total_cues))
-                if lists and total_cues == 0:
-                    print("→ キューリスト自体は見えていますが、直下のキューが0件です。")
-                    print("  cueLists/shallow は Group キューの中身を含みません(QLab公式仕様)。")
-                    print("  ショーの全キューが1つの Group の中に入っている構成だと、")
-                    print("  このツールにはキューが1つも無いように見えます。")
-                elif not lists:
+                total_cues = sum(len(_flatten_cues(cl.get("cues") or []))
+                                 for cl in lists if isinstance(cl, dict))
+                print("\nキューリスト: %d件 / キュー数(Group展開後・合計): %d" % (len(lists), total_cues))
+                if not lists:
                     print("→ キューリストが1つもありません。QLab側でCue Listが作成されているか確認してください。")
+                elif total_cues == 0:
+                    print("→ キューリストはありますが、キューが1つもありません(空のショー)。")
 
             print("\n→ この値をそのまま入力欄に入れれば使えます: %s:%d" % (ip, pnum))
         except (QLabError, OSError) as ex:

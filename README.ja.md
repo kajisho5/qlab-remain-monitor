@@ -92,7 +92,8 @@ Companion 側で **Custom Variables** に同名の変数を先に作っておく
 - 接続時に `/version` → `/workspaces` → `/workspace/{id}/connect` → `/alwaysReply 1`
 - 30Hz で `runningOrPausedCues/shallow` と各キューの `actionElapsed` `currentDuration`
   `isPaused`、プレイヘッドを取得（`--rate` で 1-60Hz に変更可）
-- 5秒ごとに `cueLists/shallow` でキューリスト構造をスキャン
+- 5秒ごとに `cueLists`（Groupキューの中身を含む完全版）でキューリスト構造をスキャンし、
+  Groupキュー（入れ子含む）は展開してキュー一覧に表示する
 - SSE でブラウザに push、ブラウザ側は 60fps で自走しサーバ値へ滑らかに追従
 
 ## 6. 既知の制限

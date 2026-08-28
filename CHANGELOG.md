@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0
+- Fix: cues nested inside a Group cue (a common way to structure a whole show) never
+  showed up in the monitor. Structure scan now queries `cueLists` instead of
+  `cueLists/shallow` and recursively flattens Group children (nested Groups included)
+  into the cue list display, in order. Unit-tested against a synthetic nested-Group
+  structure.
+
 ## 1.2.1
 - `--try` now also queries `cueLists/shallow` and shows QLab's raw reply when the cue
   list comes back empty, instead of silently showing nothing. Distinguishes a real

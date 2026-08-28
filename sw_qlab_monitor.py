@@ -32,7 +32,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 DEFAULT_OSC_PORT = 53000
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
@@ -522,6 +522,43 @@ def _flatten_cues(cue_list):
         else:
             out.append(cu)
     return out
+
+
+def diagnose_workspace(host, port, passcode="", timeout=5.0):
+    """host:port の QLab に一時的に接続して cueLists の生応答を調べ、診断メッセージの
+    行リストを返す(--try のコンソール出力 と GUI「詳細診断」ボタンの両方から使う)。"""
+    lines = []
+    c = QLabClient(host, port, passcode, timeout=timeout)
+    try:
+        c.connect()
+        lines.append("QLab応答: OK  version %s / workspace %s" % (c.version, c.workspace_name))
+        run = c.call("/workspace/%s/runningOrPausedCues/shallow" % c.workspace) or []
+        lines.append("再生中のキュー: %d" % len(run))
+
+        raw_cl = c.call_raw("/workspace/%s/cueLists" % c.workspace)
+        status = raw_cl.get("status") if isinstance(raw_cl, dict) else None
+        if status not in (None, "ok"):
+            lines.append("cueLists への応答: status=%s" % status)
+            lines.append("生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
+            lines.append("→ Workspace Settings › Network › OSC Access で、使っている")
+            lines.append("  パスコード(または No Passcode)の view 権限が有効か確認してください。")
+        else:
+            data = raw_cl.get("data") if isinstance(raw_cl, dict) else raw_cl
+            lists = data if isinstance(data, list) else []
+            total_cues = sum(len(_flatten_cues(cl.get("cues") or []))
+                             for cl in lists if isinstance(cl, dict))
+            lines.append("キューリスト: %d件 / キュー数(Group展開後・合計): %d" % (len(lists), total_cues))
+            if not lists:
+                lines.append("→ キューリストが1つもありません。QLab側でCue Listが作成されているか確認を。")
+                lines.append("生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
+            elif total_cues == 0:
+                lines.append("→ キューリストはありますが、キューが1つもありません(空のショー)。")
+                lines.append("生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
+    except (QLabError, OSError) as ex:
+        lines.append("QLab応答: なし (%s)" % ex)
+    finally:
+        c.close()
+    return lines
 
 
 def parse_targets(text, default_port=DEFAULT_OSC_PORT):
@@ -1732,10 +1769,30 @@ def run_gui(host, port, web_port):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def do_diagnose():
+        h = host_var.get().strip()
+        if not h:
+            log("詳細診断: QLab の IP を先に入力してください")
+            return
+        try:
+            p = int(port_var.get().strip() or DEFAULT_OSC_PORT)
+        except ValueError:
+            p = DEFAULT_OSC_PORT
+        pw = pass_var.get().strip()
+        log("詳細診断: %s:%d に一時接続してキューリストを確認します…" % (h, p))
+
+        def worker():
+            for line in diagnose_workspace(h, p, pw, timeout=5.0):
+                log("  " + line)
+            log("詳細診断: 完了")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     btn_start = mkbtn("接続してモニター起動", start)
     mkbtn("ブラウザで開く", open_ui)
     mkbtn("再スキャン", lambda: state["monitor"] and state["monitor"].rescan())
     mkbtn("Bonjourで検索", do_bonjour_discover)
+    mkbtn("詳細診断", do_diagnose)
 
     status.pack(anchor="w", pady=(16, 2))
     detail.pack(anchor="w")
@@ -1876,38 +1933,9 @@ def main():
             print("→ QLab が起動しているか、Workspace Settings › Network › OSC Access で")
             print("  「Allow OSC Connections」が有効か、OSC Listening Port が %d か確認を。" % pnum)
             return
-        c = QLabClient(ip, pnum, args.passcode, timeout=5.0)
-        try:
-            c.connect()
-            print("QLab 応答: OK  version %s / workspace %s" % (c.version, c.workspace_name))
-            run = c.call("/workspace/%s/runningOrPausedCues/shallow" % c.workspace) or []
-            print("再生中のキュー: %d" % len(run))
-
-            raw_cl = c.call_raw("/workspace/%s/cueLists" % c.workspace)
-            status = raw_cl.get("status") if isinstance(raw_cl, dict) else None
-            if status not in (None, "ok"):
-                print("\ncueLists への応答: status=%s" % status)
-                print("  生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
-                print("→ QLab側でこのリクエストが denied/error になっています。")
-                print("  Workspace Settings › Network › OSC Access で、使っている")
-                print("  パスコード(または No Passcode)の view 権限が有効か確認してください。")
-            else:
-                data = raw_cl.get("data") if isinstance(raw_cl, dict) else raw_cl
-                lists = data if isinstance(data, list) else []
-                total_cues = sum(len(_flatten_cues(cl.get("cues") or []))
-                                 for cl in lists if isinstance(cl, dict))
-                print("\nキューリスト: %d件 / キュー数(Group展開後・合計): %d" % (len(lists), total_cues))
-                if not lists:
-                    print("→ キューリストが1つもありません。QLab側でCue Listが作成されているか確認してください。")
-                elif total_cues == 0:
-                    print("→ キューリストはありますが、キューが1つもありません(空のショー)。")
-
-            print("\n→ この値をそのまま入力欄に入れれば使えます: %s:%d" % (ip, pnum))
-        except (QLabError, OSError) as ex:
-            print("QLab 応答: なし (%s)" % ex)
-            print("→ パスコードが設定されている場合は --passcode で指定してください。")
-        finally:
-            c.close()
+        for line in diagnose_workspace(ip, pnum, args.passcode, timeout=5.0):
+            print(line)
+        print("\n→ この値をそのまま入力欄に入れれば使えます: %s:%d" % (ip, pnum))
         return
 
     host = args.host or cfg.get("host") or ""

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.2
+- New "詳細診断" button in the settings window: opens a temporary connection to the
+  configured QLab and shows QLab's actual `cueLists` reply (list/cue counts, raw JSON
+  on anything unexpected) right in the log box. Same logic `--try` used, factored out
+  into `diagnose_workspace()` so both share one implementation. Useful when a cue list
+  isn't showing and running a separate CLI diagnostic isn't convenient.
+
 ## 1.3.1
 - Suppress the harmless `ConnectionAbortedError`/`ConnectionResetError` traceback that
   Python's HTTP server prints when the browser closes a keep-alive connection mid-poll

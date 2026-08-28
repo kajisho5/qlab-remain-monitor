@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.1
+- Suppress the harmless `ConnectionAbortedError`/`ConnectionResetError` traceback that
+  Python's HTTP server prints when the browser closes a keep-alive connection mid-poll
+  (common on Windows, `WinError 10053`). Genuinely unexpected server errors still print
+  as before -- only the known disconnect exceptions are silenced.
+
 ## 1.3.0
 - Fix: cues nested inside a Group cue (a common way to structure a whole show) never
   showed up in the monitor. Structure scan now queries `cueLists` instead of

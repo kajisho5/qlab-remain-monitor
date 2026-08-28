@@ -32,7 +32,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DEFAULT_OSC_PORT = 53000
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
@@ -1348,6 +1348,20 @@ startStream(); poll();
 """
 
 
+class QuietHTTPServer(ThreadingHTTPServer):
+    """ブラウザがタブを閉じる/再接続するなどでHTTP接続を中断しただけの、
+    無害な切断例外(WinError 10053 等)でコンソールにトレースバックを出さない。
+    それ以外の予期しない例外は通常通り表示する。"""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     monitor = None
     server_version = "SWQLabMonitor/" + VERSION
@@ -1673,7 +1687,7 @@ def run_gui(host, port, web_port):
             wp = state["web_port"]
             for cand in range(wp, wp + 20):
                 try:
-                    state["httpd"] = ThreadingHTTPServer(("0.0.0.0", cand), Handler)
+                    state["httpd"] = QuietHTTPServer(("0.0.0.0", cand), Handler)
                     state["web_port"] = cand
                     break
                 except OSError:
@@ -1922,7 +1936,7 @@ def main():
                       rate=args.companion_rate).start()
         print(" Companion : %s:%s へ変数送信" % (chost, cport or COMPANION_PORT))
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", args.web_port), Handler)
+    httpd = QuietHTTPServer(("0.0.0.0", args.web_port), Handler)
     url = "http://localhost:%d/" % args.web_port
     print("=" * 58)
     print(" SW QLAB MONITOR  v%s" % VERSION)

@@ -26,6 +26,9 @@ QLab 4: 設定 → **OSC** → **Use OSC Controls** にチェック。
 
 **Windows**: `SW-QLAB-MONITOR.bat` をダブルクリック → 設定ウィンドウ
 - `QLab の IP` に Mac の IP（カンマ区切りで複数台可）
+- IP が分からなければ **Bonjourで検索** ボタン → 同一LAN上のQLabをワークスペース名で
+  自動検出し、選ぶとIP/ポートが入る（公式のQLab Remoteアプリと同じ `_qlab._tcp.local.` の
+  仕組みを使用。追加ライブラリ不要）
 - パスコードを設定している場合のみ `パスコード` 欄に入力
 - **接続してモニター起動** でブラウザにモニター画面
 
@@ -43,6 +46,7 @@ TCP が届くか・QLab が応答するか・ワークスペース名まで出�
 python sw_qlab_monitor.py --host 192.168.0.30 --console
 python sw_qlab_monitor.py --host 192.168.0.30 --passcode 1234 --console
 python sw_qlab_monitor.py --demo
+python sw_qlab_monitor.py --discover   # Bonjourで検索して一覧表示
 ```
 
 モニター画面は `http://localhost:8780`。

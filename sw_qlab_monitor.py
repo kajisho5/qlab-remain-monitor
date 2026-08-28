@@ -8,11 +8,13 @@ QLab (4 / 5) を LAN 経由で監視するスタンドアロン・モニター�
 - Python 標準ライブラリのみ / 単一ファイル
 - ブラウザ UI (http://localhost:8780) — 同一 LAN の別端末からも閲覧可
 - Bitfocus Companion のカスタム変数に REMAIN 等を流し込める
+- Bonjour (_qlab._tcp.local.) でLAN上のQLabを自動検出 (追加ライブラリ不要)
 
 Usage:
     python sw_qlab_monitor.py                       # 設定ウィンドウ
     python sw_qlab_monitor.py --host 192.168.0.30 --console
     python sw_qlab_monitor.py --demo                # 実機なしで動作確認
+    python sw_qlab_monitor.py --discover            # Bonjourで検索して終了
 """
 
 import argparse
@@ -30,7 +32,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_OSC_PORT = 53000
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
@@ -325,6 +327,135 @@ def local_ips():
     except socket.gaierror:
         pass
     return sorted(i for i in ips if not i.startswith("127."))
+
+
+# ---------------------------------------------------------------- Bonjour (mDNS) 検索
+# QLab は "_qlab._tcp.local." で自分自身を Bonjour に広告する (QLab Remote が
+# ワークスペースを自動的に見つけて接続できるのはこの仕組みによる)。
+# 追加ライブラリなしで最低限の mDNS クライアント(質問送信 + 応答パース)を実装する。
+MDNS_ADDR = "224.0.0.251"
+MDNS_PORT = 5353
+QLAB_MDNS_SERVICE = "_qlab._tcp.local."
+
+
+def _mdns_encode_name(name):
+    out = b""
+    for part in name.rstrip(".").split("."):
+        b = part.encode("utf-8")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _mdns_build_query(service):
+    header = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
+    question = _mdns_encode_name(service) + struct.pack(">HH", 12, 1)  # PTR, IN
+    return header + question
+
+
+def _mdns_read_name(data, offset):
+    """DNS 名前圧縮(0xC0 ポインタ)に対応した名前デコード。
+    戻り値: (name, 直後に続くオフセット)"""
+    labels = []
+    jumped, after_offset = False, None
+    guard = 0
+    while guard < 128:
+        guard += 1
+        if offset >= len(data):
+            break
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            break
+        if (length & 0xC0) == 0xC0:
+            if offset + 1 >= len(data):
+                break
+            pointer = ((length & 0x3F) << 8) | data[offset + 1]
+            if not jumped:
+                after_offset = offset + 2
+            offset = pointer
+            jumped = True
+            continue
+        offset += 1
+        labels.append(data[offset:offset + length].decode("utf-8", "replace"))
+        offset += length
+    name = (".".join(labels) + ".") if labels else ""
+    return name, (after_offset if jumped else offset)
+
+
+def _mdns_parse_records(data):
+    try:
+        _id, _flags, qd, an, ns, ar = struct.unpack(">HHHHHH", data[:12])
+    except struct.error:
+        return []
+    offset = 12
+    for _ in range(qd):
+        _name, offset = _mdns_read_name(data, offset)
+        offset += 4  # QTYPE + QCLASS
+    records = []
+    for _ in range(an + ns + ar):
+        if offset >= len(data):
+            break
+        name, offset = _mdns_read_name(data, offset)
+        if offset + 10 > len(data):
+            break
+        rtype, _rclass, _ttl, rdlength = struct.unpack(">HHIH", data[offset:offset + 10])
+        offset += 10
+        rdata = data[offset:offset + rdlength]
+        records.append({"name": name, "type": rtype, "rdata": rdata, "rdata_offset": offset})
+        offset += rdlength
+    return records
+
+
+def mdns_discover_qlab(timeout=3.0):
+    """LAN上の QLab を Bonjour ("_qlab._tcp.local.") で検索する。
+    -> [{"name": ワークスペース表示名, "host": IP, "port": ポート}, ...]"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    try:
+        sock.bind(("", MDNS_PORT))
+        mreq = struct.pack("4sl", socket.inet_aton(MDNS_ADDR), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except OSError:
+        sock.close()
+        return []
+    sock.settimeout(0.4)
+    try:
+        sock.sendto(_mdns_build_query(QLAB_MDNS_SERVICE), (MDNS_ADDR, MDNS_PORT))
+    except OSError:
+        sock.close()
+        return []
+
+    srv_by_name, a_by_host = {}, {}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            data, _addr = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        for rec in _mdns_parse_records(data):
+            if rec["type"] == 33 and rec["name"].lower().endswith(QLAB_MDNS_SERVICE):
+                if len(rec["rdata"]) < 6:
+                    continue
+                _prio, _weight, port = struct.unpack(">HHH", rec["rdata"][:6])
+                target, _ = _mdns_read_name(data, rec["rdata_offset"] + 6)
+                srv_by_name[rec["name"]] = {"host": target, "port": port}
+            elif rec["type"] == 1 and len(rec["rdata"]) == 4:  # A record
+                a_by_host[rec["name"]] = ".".join(str(b) for b in rec["rdata"])
+    sock.close()
+
+    suffix = "." + QLAB_MDNS_SERVICE
+    results = []
+    for full_name, srv in srv_by_name.items():
+        display = full_name[:-len(suffix)] if full_name.lower().endswith(suffix) else full_name
+        ip = a_by_host.get(srv["host"], srv["host"])
+        results.append({"name": display, "host": ip, "port": srv["port"]})
+    return results
 
 
 def tcp_open(ip, port, timeout=3.0, source_ip=None):
@@ -1442,8 +1573,18 @@ def run_gui(host, port, web_port):
     style.configure("SW.TCombobox", fieldbackground="#101010", background="#101010",
                     foreground=FG, arrowcolor=FG, bordercolor=LINE, lightcolor=LINE,
                     darkcolor=LINE, selectbackground="#242424", selectforeground=FG)
-    ttk.Combobox(row, textvariable=host_var, values=[], width=26, font=mono,
-                 style="SW.TCombobox").grid(row=1, column=0, sticky="w", pady=(3, 0))
+    host_combo = ttk.Combobox(row, textvariable=host_var, values=[], width=26, font=mono,
+                              style="SW.TCombobox")
+    host_combo.grid(row=1, column=0, sticky="w", pady=(3, 0))
+    bonjour_map = {}
+
+    def on_bonjour_select(_event=None):
+        item = bonjour_map.get(host_var.get())
+        if item:
+            host_var.set(item[0])
+            port_var.set(str(item[1]))
+
+    host_combo.bind("<<ComboboxSelected>>", on_bonjour_select)
     for col, var, w in ((1, port_var, 8), (2, pass_var, 12), (3, comp_var, 15)):
         tk.Entry(row, textvariable=var, width=w, font=mono, bg="#101010", fg=FG,
                  insertbackground=FG, relief="flat").grid(row=1, column=col, sticky="w",
@@ -1515,9 +1656,36 @@ def run_gui(host, port, web_port):
         if open_browser:
             open_ui()
 
+    def do_bonjour_discover():
+        log("Bonjour ( _qlab._tcp.local. ) で検索中…")
+
+        def worker():
+            results = mdns_discover_qlab(timeout=3.0)
+
+            def apply():
+                if not results:
+                    log("Bonjour: QLab が見つかりませんでした"
+                        "(OSC/Bonjourが無効か、別ネットワークセグメントの可能性があります)")
+                    return
+                bonjour_map.clear()
+                values = []
+                for r in results:
+                    disp = "%s  —  %s:%d" % (r["name"], r["host"], r["port"])
+                    bonjour_map[disp] = (r["host"], r["port"])
+                    values.append(disp)
+                    log("見つかりました: %s (%s:%d)" % (r["name"], r["host"], r["port"]))
+                host_combo["values"] = values
+                if len(results) == 1 and not host_var.get().strip():
+                    host_var.set(results[0]["host"])
+                    port_var.set(str(results[0]["port"]))
+            root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     btn_start = mkbtn("接続してモニター起動", start)
     mkbtn("ブラウザで開く", open_ui)
     mkbtn("再スキャン", lambda: state["monitor"] and state["monitor"].rescan())
+    mkbtn("Bonjourで検索", do_bonjour_discover)
 
     status.pack(anchor="w", pady=(16, 2))
     detail.pack(anchor="w")
@@ -1588,6 +1756,8 @@ def main():
                     help="Companion への書き込みを1回だけ試して結果を表示")
     ap.add_argument("--try", dest="try_target", metavar="IP[:PORT]",
                     help="指定の QLab に接続できるか診断して終了")
+    ap.add_argument("--discover", action="store_true",
+                    help="Bonjour (_qlab._tcp.local.) でLAN上のQLabを検索して終了")
     ap.add_argument("--demo", action="store_true", help="内蔵ダミー QLab で動作確認")
     ap.add_argument("--gui", action="store_true", help="設定ウィンドウ付きで起動")
     ap.add_argument("--console", action="store_true", help="ウィンドウ無しで起動")
@@ -1618,6 +1788,19 @@ def main():
                 print("  Variables › Custom Variables の一番下 Create custom variable で作成を。")
         except (OSError, http.client.HTTPException) as e:
             print("送信エラー: %s" % e)
+        return
+
+    if args.discover:
+        print("SW QLAB MONITOR v%s  Bonjour検索  (_qlab._tcp.local., 3秒)" % VERSION)
+        results = mdns_discover_qlab(timeout=3.0)
+        if not results:
+            print("見つかりませんでした。")
+            print("→ QLab の Workspace Settings › Network › OSC Access で OSC が有効か、")
+            print("  Bonjour/mDNSがネットワークでブロックされていないか確認してください。")
+        else:
+            for r in results:
+                print("  %-24s %s:%d" % (r["name"], r["host"], r["port"]))
+            print("\n→ この IP:ポートを --host / --port にそのまま使えます。")
         return
 
     if args.try_target:

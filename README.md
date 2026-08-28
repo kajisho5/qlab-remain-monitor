@@ -27,6 +27,8 @@ ten meters away.
 - **Browser UI** — open `http://<host>:8780` from a tablet at the desk
 - **Bitfocus Companion** integration — push remaining time into custom variables and show it
   on a Stream Deck button
+- **Bonjour discovery** — find QLab workspaces on the LAN by name (`_qlab._tcp.local.`,
+  the same mechanism the official QLab Remote app uses), no extra library required
 - **Fullscreen focus mode** (`F`) — just the numbers, nothing else
 - **Read-only**: this tool never sends GO/STOP or any other control commands
 
@@ -43,6 +45,9 @@ python sw_qlab_monitor.py --host 192.168.0.30 --console
 
 # Try it without hardware — ships with a built-in dummy QLab server
 python sw_qlab_monitor.py --demo
+
+# Find QLab workspaces on the LAN by name via Bonjour, without knowing the IP
+python sw_qlab_monitor.py --discover
 ```
 
 On Windows, double-click `SW-QLAB-MONITOR.bat` for a small settings window (no console).

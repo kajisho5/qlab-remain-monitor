@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import errno
 import http.client
 import json
 import os
@@ -32,7 +33,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 DEFAULT_OSC_PORT = 53000
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
@@ -141,7 +142,35 @@ def slip_decode_stream(buf):
 
 # ---------------------------------------------------------------- client
 class QLabError(Exception):
-    pass
+    def __init__(self, message, errno=None):
+        super().__init__(message)
+        self.errno = errno
+
+
+# OSErrorのメッセージ文字列(str(e))はOSのロケールに依存して翻訳される
+# (例: 日本語Windowsでは "unreachable" ではなく「到達できない」になる) ため、
+# 文字列マッチではなく errno で判定する。Windowsのソケットエラーは errno モジュールに
+# 'WSAE...' という名前でエラーコードがそのまま定義されている。
+def _retriable_errnos():
+    names = ("ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ECONNRESET",
+             "WSAETIMEDOUT", "WSAEHOSTUNREACH", "WSAENETUNREACH", "WSAECONNRESET")
+    return {code for code in (getattr(errno, n, None) for n in names) if code is not None}
+
+
+RETRIABLE_ERRNOS = _retriable_errnos()
+
+
+def _os_error_code(exc):
+    """OSError から比較用のエラーコードを取り出す。
+    Windows のソケットエラーは実際のコード(例: WSAEHOSTUNREACH=10065)が
+    .winerror に入り、.errno は 0 のままのことが多い(CPython の
+    PyErr_SetExcFromWindowsErr の仕様)。そのため winerror を優先し、
+    無ければ(Windows以外) errno を見る。"""
+    code = getattr(exc, "winerror", None)
+    if code:
+        return code
+    code = getattr(exc, "errno", None)
+    return code if code else None
 
 
 class QLabClient:
@@ -262,7 +291,7 @@ class QLabClient:
                 return results
             except (OSError, socket.timeout) as e:
                 self.close()
-                raise QLabError(str(e))
+                raise QLabError(str(e), errno=_os_error_code(e))
 
     @staticmethod
     def _payload(args):
@@ -630,21 +659,26 @@ class Monitor(threading.Thread):
 
                 self.poll_running()
             except QLabError as e:
-                self._fail(str(e))
+                self._fail(str(e), e.errno)
             except OSError as e:
-                self._fail(str(e))
+                self._fail(str(e), _os_error_code(e))
             except Exception as e:  # noqa: BLE001 - モニターは落とさない
                 self._fail("%s: %s" % (type(e).__name__, e))
             time.sleep(max(0.002, interval - (time.time() - t0)))
 
-    def _fail(self, msg):
+    def _fail(self, msg, err_no=None):
         self.client.close()
         with self.lock:
             self.state["connected"] = False
             self.state["error"] = msg
             self.state["running"] = []
-        # 既定の経路で駄目なら各NICを送信元にして再試行
-        if "timed out" in msg or "unreachable" in msg:
+        # 既定の経路で駄目なら各NICを送信元にして再試行。
+        # errno があればそれで判定(OSのロケールに依存しない)。errno が取れない
+        # 場合(QLabErrorが接続切断など別要因のとき等)は、英語のみだが従来の
+        # 文字列マッチもフォールバックとして残す。
+        retriable = (err_no in RETRIABLE_ERRNOS if err_no is not None
+                    else ("timed out" in msg or "unreachable" in msg))
+        if retriable:
             for src in local_ips():
                 if src == self.client.source_ip:
                     continue

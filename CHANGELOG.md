@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.3
+- Fix: automatic reconnect (retrying on each network adapter after a "host
+  unreachable"/"timed out" error) never triggered on non-English Windows, because it
+  matched the English words "timed out"/"unreachable" against `str(exception)` --
+  which is OS-locale-translated (e.g. a Japanese Windows reports
+  "到達できないホスト..." for WSAEHOSTUNREACH, with no English substring at all).
+  Now compares the actual Windows error code (`.winerror`, since CPython leaves
+  `.errno` at 0 for these) against a fixed set of retriable codes instead, so it
+  works regardless of the OS display language. Verified against a simulated
+  OSError shaped exactly like the real Windows exception (`errno=0,
+  winerror=10065`).
+
 ## 1.3.2
 - New "詳細診断" button in the settings window: opens a temporary connection to the
   configured QLab and shows QLab's actual `cueLists` reply (list/cue counts, raw JSON

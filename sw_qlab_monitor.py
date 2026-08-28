@@ -33,7 +33,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 DEFAULT_OSC_PORT = 53000
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
@@ -186,6 +186,7 @@ class QLabClient:
         self.buf = b""
         self.workspace = None       # uniqueID
         self.workspace_name = None
+        self.connect_reply = None   # /connect の生返信(診断用)
         self.lock = threading.Lock()
         self.pending = []           # 受信済みだが未処理のリプライ
 
@@ -224,6 +225,7 @@ class QLabClient:
         self.workspace_name = ws.get("displayName") or "QLab"
         res = self.call("/workspace/%s/connect" % self.workspace,
                         [self.passcode] if self.passcode else [])
+        self.connect_reply = res
         if isinstance(res, str) and res.startswith("badpass"):
             raise QLabError("パスコードが違います")
         self.call("/alwaysReply", [1])
@@ -561,28 +563,35 @@ def diagnose_workspace(host, port, passcode="", timeout=5.0):
     try:
         c.connect()
         lines.append("QLab応答: OK  version %s / workspace %s" % (c.version, c.workspace_name))
+        lines.append("connect への返信 (生): %r" % (c.connect_reply,))
         run = c.call("/workspace/%s/runningOrPausedCues/shallow" % c.workspace) or []
         lines.append("再生中のキュー: %d" % len(run))
 
-        raw_cl = c.call_raw("/workspace/%s/cueLists" % c.workspace)
-        status = raw_cl.get("status") if isinstance(raw_cl, dict) else None
-        if status not in (None, "ok"):
-            lines.append("cueLists への応答: status=%s" % status)
-            lines.append("生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
-            lines.append("→ Workspace Settings › Network › OSC Access で、使っている")
+        any_denied, any_ok = False, False
+        for label, path_suffix in (("cueLists", "/cueLists"),
+                                   ("cueLists/shallow", "/cueLists/shallow")):
+            raw_cl = c.call_raw("/workspace/%s%s" % (c.workspace, path_suffix))
+            status = raw_cl.get("status") if isinstance(raw_cl, dict) else None
+            if status not in (None, "ok"):
+                any_denied = True
+                lines.append("%s への応答: status=%s" % (label, status))
+                lines.append("  生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:400])
+            else:
+                any_ok = True
+                data = raw_cl.get("data") if isinstance(raw_cl, dict) else raw_cl
+                lists = data if isinstance(data, list) else []
+                total_cues = sum(len(_flatten_cues(cl.get("cues") or []))
+                                 for cl in lists if isinstance(cl, dict))
+                lines.append("%s: OK  キューリスト %d件 / キュー数(Group展開後) %d"
+                             % (label, len(lists), total_cues))
+
+        if any_denied and not any_ok:
+            lines.append("→ cueLists・cueLists/shallow どちらも denied/error です。")
+            lines.append("  Workspace Settings › Network › OSC Access で、使っている")
             lines.append("  パスコード(または No Passcode)の view 権限が有効か確認してください。")
-        else:
-            data = raw_cl.get("data") if isinstance(raw_cl, dict) else raw_cl
-            lists = data if isinstance(data, list) else []
-            total_cues = sum(len(_flatten_cues(cl.get("cues") or []))
-                             for cl in lists if isinstance(cl, dict))
-            lines.append("キューリスト: %d件 / キュー数(Group展開後・合計): %d" % (len(lists), total_cues))
-            if not lists:
-                lines.append("→ キューリストが1つもありません。QLab側でCue Listが作成されているか確認を。")
-                lines.append("生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
-            elif total_cues == 0:
-                lines.append("→ キューリストはありますが、キューが1つもありません(空のショー)。")
-                lines.append("生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
+        elif any_denied and any_ok:
+            lines.append("→ 片方だけ denied/error でした(下記参照)。QLabのバージョンや")
+            lines.append("  権限モデルの違いの可能性があります。")
     except (QLabError, OSError) as ex:
         lines.append("QLab応答: なし (%s)" % ex)
     finally:

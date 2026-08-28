@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.4
+- Sharpen 詳細診断/`--try`: also shows the raw `/connect` reply, and now tests both
+  `cueLists` and `cueLists/shallow` separately (previously only the non-shallow one),
+  since a real-world case showed `runningOrPausedCues` succeeding while `cueLists`
+  alone came back `status=denied` even with a passcode that has full View/Edit/Control
+  permission -- narrowing down exactly which query is denied, and whether shallow vs.
+  full makes a difference, without another guess-and-check round.
+
 ## 1.3.3
 - Fix: automatic reconnect (retrying on each network adapter after a "host
   unreachable"/"timed out" error) never triggered on non-English Windows, because it

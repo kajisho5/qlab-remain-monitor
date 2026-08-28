@@ -32,7 +32,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DEFAULT_OSC_PORT = 53000
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
@@ -223,7 +223,11 @@ class QLabClient:
     def call(self, address, args=(), want_reply=True):
         return self.call_many([(address, args)], want_reply)[0]
 
-    def call_many(self, calls, want_reply=True):
+    def call_raw(self, address, args=()):
+        """call() と同じだが status=error/denied でも中身を捨てずそのまま返す診断用。"""
+        return self.call_many([(address, args)], raw=True)[0]
+
+    def call_many(self, calls, want_reply=True, raw=False):
         """複数の OSC を一括送信し、リプライを対応付けて返す。"""
         if not self.sock:
             raise QLabError("not connected")
@@ -249,7 +253,7 @@ class QLabClient:
                         for i, (want, _a) in enumerate(calls):
                             if filled[i] or not self._match(addr, want):
                                 continue
-                            results[i] = self._payload(args)
+                            results[i] = self._raw_payload(args) if raw else self._payload(args)
                             filled[i] = hit = True
                             break
                         if not hit:
@@ -276,6 +280,19 @@ class QLabClient:
                 return msg.get("data")
             return msg
         return raw
+
+    @staticmethod
+    def _raw_payload(args):
+        """_payload() と違い status=error/denied でもそのまま返す(診断用)。"""
+        if not args:
+            return None
+        v = args[0]
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except ValueError:
+                return v
+        return v
 
 
 # ---------------------------------------------------------------- helpers
@@ -1832,7 +1849,29 @@ def main():
             print("QLab 応答: OK  version %s / workspace %s" % (c.version, c.workspace_name))
             run = c.call("/workspace/%s/runningOrPausedCues/shallow" % c.workspace) or []
             print("再生中のキュー: %d" % len(run))
-            print("→ この値をそのまま入力欄に入れれば使えます: %s:%d" % (ip, pnum))
+
+            raw_cl = c.call_raw("/workspace/%s/cueLists/shallow" % c.workspace)
+            status = raw_cl.get("status") if isinstance(raw_cl, dict) else None
+            if status not in (None, "ok"):
+                print("\ncueLists/shallow への応答: status=%s" % status)
+                print("  生データ: %s" % json.dumps(raw_cl, ensure_ascii=False)[:500])
+                print("→ QLab側でこのリクエストが denied/error になっています。")
+                print("  Workspace Settings › Network › OSC Access で、使っている")
+                print("  パスコード(または No Passcode)の view 権限が有効か確認してください。")
+            else:
+                data = raw_cl.get("data") if isinstance(raw_cl, dict) else raw_cl
+                lists = data if isinstance(data, list) else []
+                total_cues = sum(len(cl.get("cues") or []) for cl in lists if isinstance(cl, dict))
+                print("\nキューリスト: %d件 / 直下のキュー数(合計): %d" % (len(lists), total_cues))
+                if lists and total_cues == 0:
+                    print("→ キューリスト自体は見えていますが、直下のキューが0件です。")
+                    print("  cueLists/shallow は Group キューの中身を含みません(QLab公式仕様)。")
+                    print("  ショーの全キューが1つの Group の中に入っている構成だと、")
+                    print("  このツールにはキューが1つも無いように見えます。")
+                elif not lists:
+                    print("→ キューリストが1つもありません。QLab側でCue Listが作成されているか確認してください。")
+
+            print("\n→ この値をそのまま入力欄に入れれば使えます: %s:%d" % (ip, pnum))
         except (QLabError, OSError) as ex:
             print("QLab 応答: なし (%s)" % ex)
             print("→ パスコードが設定されている場合は --passcode で指定してください。")

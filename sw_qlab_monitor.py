@@ -33,8 +33,9 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.4"
+VERSION = "1.4.0"
 DEFAULT_OSC_PORT = 53000
+DEFAULT_UDP_REPLY_PORT = 53001  # QLabがUDP応答を送り返してくる既定ポート(VTKounterと同じ)
 DEFAULT_WEB_PORT = 8780
 COMPANION_PORT = 8000
 POLL_HZ = 30.0
@@ -176,19 +177,28 @@ def _os_error_code(exc):
 class QLabClient:
     """QLab OSC API (TCP / SLIP)。リプライは JSON で返るので dict にして返す。"""
 
-    def __init__(self, host, port=DEFAULT_OSC_PORT, passcode="", timeout=4.0, source_ip=None):
+    def __init__(self, host, port=DEFAULT_OSC_PORT, passcode="", timeout=4.0, source_ip=None,
+                udp=False, udp_reply_port=DEFAULT_UDP_REPLY_PORT):
         self.host = host
         self.port = int(port)
         self.passcode = passcode or ""
         self.timeout = timeout
         self.source_ip = source_ip
+        self.udp = udp
+        self.udp_reply_port = udp_reply_port
         self.sock = None
         self.buf = b""
-        self.workspace = None       # uniqueID
+        self.workspace = None       # uniqueID (UDPモードでは常にNone: ワークスペースを指定しない)
         self.workspace_name = None
-        self.connect_reply = None   # /connect の生返信(診断用)
+        self.version = None
+        self.connect_reply = None   # /connect の生返信(診断用、UDPモードでは使わない)
         self.lock = threading.Lock()
         self.pending = []           # 受信済みだが未処理のリプライ
+
+    def _ws(self, path):
+        """OSCアドレスを組み立てる。TCPモードは /workspace/{id}を前置、UDPモード
+        (VTKounter方式)はワークスペース指定なし・パスコード認証も行わない。"""
+        return path if self.udp else "/workspace/%s%s" % (self.workspace, path)
 
     @property
     def connected(self):
@@ -206,6 +216,29 @@ class QLabClient:
 
     def connect(self):
         self.close()
+        if self.udp:
+            # UDPモード(VTKounter方式): TCP接続もワークスペース指定/パスコード認証も
+            # 行わない。ソケットを開いて疎通確認だけ行う。
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", self.udp_reply_port))
+            except OSError as e:
+                raise QLabError("UDP応答ポート %d を開けません: %s"
+                                % (self.udp_reply_port, e), errno=_os_error_code(e))
+            s.settimeout(self.timeout)
+            self.sock = s
+            self.workspace = None
+            self.workspace_name = "QLab (UDP)"
+            self.version = "?"
+            ver = self.call("/version")
+            if ver is None:
+                raise QLabError("QLab が応答しません"
+                                "（OSC/UDPが無効、ポート違い、または応答ポート%d が"
+                                "ファイアウォールで塞がれている可能性）" % self.udp_reply_port)
+            self.version = ver
+            return
+
         s = socket.create_connection(
             (self.host, self.port), timeout=self.timeout,
             source_address=(self.source_ip, 0) if self.source_ip else None)
@@ -233,9 +266,18 @@ class QLabClient:
 
     # -- io -----------------------------------------------------------
     def _send(self, address, args=()):
-        self.sock.sendall(slip_encode(osc_encode(address, args)))
+        if self.udp:
+            self.sock.sendto(osc_encode(address, args), (self.host, self.port))
+        else:
+            self.sock.sendall(slip_encode(osc_encode(address, args)))
 
     def _recv_replies(self):
+        if self.udp:
+            data = self.sock.recv(65535)
+            addr, args = osc_decode(data)
+            if addr:
+                self.pending.append((addr, args))
+            return
         chunk = self.sock.recv(262144)
         if not chunk:
             raise QLabError("QLab が接続を閉じました")
@@ -263,11 +305,15 @@ class QLabClient:
         if not self.sock:
             raise QLabError("not connected")
         with self.lock:
-            out = b""
-            for addr, args in calls:
-                out += slip_encode(osc_encode(addr, args))
             try:
-                self.sock.sendall(out)
+                if self.udp:
+                    for addr, args in calls:
+                        self.sock.sendto(osc_encode(addr, args), (self.host, self.port))
+                else:
+                    out = b""
+                    for addr, args in calls:
+                        out += slip_encode(osc_encode(addr, args))
+                    self.sock.sendall(out)
                 if not want_reply:
                     return [None] * len(calls)
                 results = [None] * len(calls)
@@ -555,22 +601,32 @@ def _flatten_cues(cue_list):
     return out
 
 
-def diagnose_workspace(host, port, passcode="", timeout=5.0):
+def diagnose_workspace(host, port, passcode="", timeout=5.0,
+                       udp=False, udp_reply_port=DEFAULT_UDP_REPLY_PORT):
     """host:port の QLab に一時的に接続して cueLists の生応答を調べ、診断メッセージの
     行リストを返す(--try のコンソール出力 と GUI「詳細診断」ボタンの両方から使う)。"""
     lines = []
-    c = QLabClient(host, port, passcode, timeout=timeout)
+    c = QLabClient(host, port, passcode, timeout=timeout, udp=udp, udp_reply_port=udp_reply_port)
     try:
         c.connect()
-        lines.append("QLab応答: OK  version %s / workspace %s" % (c.version, c.workspace_name))
-        lines.append("connect への返信 (生): %r" % (c.connect_reply,))
-        run = c.call("/workspace/%s/runningOrPausedCues/shallow" % c.workspace) or []
+        if udp:
+            lines.append("QLab応答: OK (UDPモード, version %s)" % c.version)
+            lines.append("※ UDPモードはワークスペース指定・パスコード認証を行いません"
+                         "(VTKounter方式)")
+        else:
+            lines.append("QLab応答: OK  version %s / workspace %s" % (c.version, c.workspace_name))
+            lines.append("connect への返信 (生): %r" % (c.connect_reply,))
+        running_path = "/runningOrPausedCues" if udp else "/runningOrPausedCues/shallow"
+        run = c.call(c._ws(running_path)) or []
         lines.append("再生中のキュー: %d" % len(run))
+
+        if udp:
+            return lines
 
         any_denied, any_ok = False, False
         for label, path_suffix in (("cueLists", "/cueLists"),
                                    ("cueLists/shallow", "/cueLists/shallow")):
-            raw_cl = c.call_raw("/workspace/%s%s" % (c.workspace, path_suffix))
+            raw_cl = c.call_raw(c._ws(path_suffix))
             status = raw_cl.get("status") if isinstance(raw_cl, dict) else None
             if status not in (None, "ok"):
                 any_denied = True
@@ -617,11 +673,13 @@ class Monitor(threading.Thread):
     daemon = True
 
     def __init__(self, host, port=DEFAULT_OSC_PORT, passcode="",
-                 source_ip=None, dev_id="d1", name=None):
+                 source_ip=None, dev_id="d1", name=None,
+                 udp=False, udp_reply_port=DEFAULT_UDP_REPLY_PORT):
         super().__init__()
         self.dev_id = dev_id
         self.name = name or ("%s:%d" % (host, int(port)) if host else "QLab")
-        self.client = QLabClient(host, port, passcode, source_ip=source_ip)
+        self.client = QLabClient(host, port, passcode, source_ip=source_ip,
+                                 udp=udp, udp_reply_port=udp_reply_port)
         self.lock = threading.Lock()
         self.stop_flag = threading.Event()
         self.force_scan = threading.Event()
@@ -661,7 +719,12 @@ class Monitor(threading.Thread):
                     self.detail = {}
                     self.force_scan.set()
 
-                if self.force_scan.is_set() or (time.time() - self.last_scan) > STRUCTURE_INTERVAL:
+                # UDPモード(VTKounter方式)は cueLists (キューリスト構造)を一切
+                # 取得しない -- VTKounterがそうしているのと同じで、再生中のキューの
+                # 情報だけで完結させる。cueLists は一部のQLab設定でdenied/timeoutに
+                # なることがあり、そこで毎周期詰まるとpoll_runningまで動かなくなる。
+                if not self.client.udp and (self.force_scan.is_set()
+                                            or (time.time() - self.last_scan) > STRUCTURE_INTERVAL):
                     self.force_scan.clear()
                     self.scan_lists()
                     self.last_scan = time.time()
@@ -707,7 +770,7 @@ class Monitor(threading.Thread):
         # 非 shallow: Group キューの中身(子キュー)も含めて取得する。
         # shallow だと Group の中身が一切返らず、ショー全体を1つの Group に
         # まとめている構成だと「キューが1つも無い」ように見えてしまう。
-        raw = c.call("/workspace/%s/cueLists" % ws) or []
+        raw = c.call(c._ws("/cueLists")) or []
         lists = []
         for cl in raw if isinstance(raw, list) else []:
             cues = []
@@ -723,7 +786,7 @@ class Monitor(threading.Thread):
             targets = lst["cues"][:120]
             if not targets:
                 continue
-            res = c.call_many([("/workspace/%s/cue_id/%s/currentDuration" % (ws, x["id"]), ())
+            res = c.call_many([(c._ws("/cue_id/%s/currentDuration" % x["id"]), ())
                                for x in targets])
             for x, d in zip(targets, res):
                 x["dur"] = round(_num(d), 3)
@@ -737,11 +800,10 @@ class Monitor(threading.Thread):
         need = [i for i in ids if i and i not in self.detail]
         if not need:
             return
-        ws = self.client.workspace
         calls = []
         for cid in need[:8]:
-            calls.append(("/workspace/%s/cue_id/%s/fileTarget" % (ws, cid), ()))
-            calls.append(("/workspace/%s/cue_id/%s/listName" % (ws, cid), ()))
+            calls.append((self.client._ws("/cue_id/%s/fileTarget" % cid), ()))
+            calls.append((self.client._ws("/cue_id/%s/listName" % cid), ()))
         res = self.client.call_many(calls)
         for i, cid in enumerate(need[:8]):
             path = res[2 * i]
@@ -755,12 +817,14 @@ class Monitor(threading.Thread):
     # -- running ------------------------------------------------------
     def poll_running(self):
         c = self.client
-        ws = c.workspace
+        # UDPモード(VTKounter方式)は /shallow を使わない(VTKounterが実際に
+        # 使っているのは無印の /runningOrPausedCues のため、それに合わせる)
+        running_path = "/runningOrPausedCues" if c.udp else "/runningOrPausedCues/shallow"
         head = c.call_many([
-            ("/workspace/%s/runningOrPausedCues/shallow" % ws, ()),
-            ("/workspace/%s/cue/playhead/uniqueID" % ws, ()),
-            ("/workspace/%s/cue/playhead/displayName" % ws, ()),
-            ("/workspace/%s/cue/playhead/number" % ws, ()),
+            (c._ws(running_path), ()),
+            (c._ws("/cue/playhead/uniqueID"), ()),
+            (c._ws("/cue/playhead/displayName"), ()),
+            (c._ws("/cue/playhead/number"), ()),
         ])
         raw, ph_id, ph_name, ph_num = head
         cues = [x for x in (raw or []) if isinstance(x, dict)]
@@ -769,9 +833,9 @@ class Monitor(threading.Thread):
             calls = []
             for x in cues:
                 cid = x.get("uniqueID")
-                calls.append(("/workspace/%s/cue_id/%s/actionElapsed" % (ws, cid), ()))
-                calls.append(("/workspace/%s/cue_id/%s/currentDuration" % (ws, cid), ()))
-                calls.append(("/workspace/%s/cue_id/%s/isPaused" % (ws, cid), ()))
+                calls.append((c._ws("/cue_id/%s/actionElapsed" % cid), ()))
+                calls.append((c._ws("/cue_id/%s/currentDuration" % cid), ()))
+                calls.append((c._ws("/cue_id/%s/isPaused" % cid), ()))
             vals = c.call_many(calls)
         else:
             vals = []
@@ -809,17 +873,25 @@ class Monitor(threading.Thread):
 
 # ---------------------------------------------------------------- devices
 class DeviceManager:
-    def __init__(self, targets=(), passcode="", source_ip=None):
+    def __init__(self, targets=(), passcode="", source_ip=None,
+                udp=False, udp_reply_port=DEFAULT_UDP_REPLY_PORT):
         self.monitors = []
         self.passcode = passcode
         self.source_ip = source_ip
+        self.udp = udp
+        self.udp_reply_port = udp_reply_port
         self.set_targets(targets)
 
-    def set_targets(self, targets, passcode=None, source_ip=None):
+    def set_targets(self, targets, passcode=None, source_ip=None,
+                    udp=None, udp_reply_port=None):
         if passcode is not None:
             self.passcode = passcode
         if source_ip is not None:
             self.source_ip = source_ip
+        if udp is not None:
+            self.udp = udp
+        if udp_reply_port is not None:
+            self.udp_reply_port = udp_reply_port
         targets = [(h, int(p)) for h, p in targets if h]
         keep, seen = [], set()
         for host, port in targets:
@@ -827,13 +899,15 @@ class DeviceManager:
                 continue
             seen.add((host, port))
             found = next((m for m in self.monitors
-                          if m.client.host == host and m.client.port == port), None)
+                          if m.client.host == host and m.client.port == port
+                          and m.client.udp == self.udp), None)
             if found:
                 found.client.passcode = self.passcode
                 keep.append(found)
             else:
                 mon = Monitor(host, port, self.passcode, self.source_ip,
-                              dev_id="d%d" % len(seen))
+                              dev_id="d%d" % len(seen),
+                              udp=self.udp, udp_reply_port=self.udp_reply_port)
                 mon.start()
                 keep.append(mon)
         for m in self.monitors:
@@ -1720,6 +1794,13 @@ def run_gui(host, port, web_port):
                  insertbackground=FG, relief="flat").grid(row=1, column=col, sticky="w",
                                                           padx=(12, 0), pady=(3, 0))
 
+    udp_var = tk.BooleanVar(value=bool(cfg.get("udp", False)))
+    tk.Checkbutton(row, text="UDPモード(パスコード不要・VTKounter方式)", variable=udp_var,
+                  bg=BG, fg=DIM, selectcolor="#101010", activebackground=BG,
+                  activeforeground=FG, font=("Consolas", 9),
+                  highlightthickness=0).grid(row=2, column=0, columnspan=4, sticky="w",
+                                             pady=(6, 0))
+
     btns = tk.Frame(wrap, bg=BG); btns.pack(fill="x", pady=(16, 0))
 
     def mkbtn(text, cmd):
@@ -1758,10 +1839,11 @@ def run_gui(host, port, web_port):
         except ValueError:
             p = DEFAULT_OSC_PORT
         pw, comp = pass_var.get().strip(), comp_var.get().strip()
-        save_config({"host": h, "port": p, "passcode": pw, "companion": comp})
+        udp = udp_var.get()
+        save_config({"host": h, "port": p, "passcode": pw, "companion": comp, "udp": udp})
         targets = parse_targets(h, p)
         if state["monitor"] is None:
-            mgr = DeviceManager(targets, passcode=pw)
+            mgr = DeviceManager(targets, passcode=pw, udp=udp)
             Handler.monitor = mgr
             state["monitor"] = mgr
             wp = state["web_port"]
@@ -1774,7 +1856,7 @@ def run_gui(host, port, web_port):
                     continue
             threading.Thread(target=state["httpd"].serve_forever, daemon=True).start()
         else:
-            state["monitor"].set_targets(targets, passcode=pw)
+            state["monitor"].set_targets(targets, passcode=pw, udp=udp)
         if state["comp"] and state["comp"].host != comp.split(":")[0]:
             state["comp"].stop_flag.set(); state["comp"] = None
         if comp and not state["comp"]:
@@ -1822,10 +1904,12 @@ def run_gui(host, port, web_port):
         except ValueError:
             p = DEFAULT_OSC_PORT
         pw = pass_var.get().strip()
-        log("詳細診断: %s:%d に一時接続してキューリストを確認します…" % (h, p))
+        udp = udp_var.get()
+        log("詳細診断: %s:%d に一時接続してキューリストを確認します… %s"
+            % (h, p, "(UDPモード)" if udp else ""))
 
         def worker():
-            for line in diagnose_workspace(h, p, pw, timeout=5.0):
+            for line in diagnose_workspace(h, p, pw, timeout=5.0, udp=udp):
                 log("  " + line)
             log("詳細診断: 完了")
 
@@ -1908,6 +1992,12 @@ def main():
                     help="指定の QLab に接続できるか診断して終了")
     ap.add_argument("--discover", action="store_true",
                     help="Bonjour (_qlab._tcp.local.) でLAN上のQLabを検索して終了")
+    ap.add_argument("--udp", action="store_true", default=cfg.get("udp", False),
+                    help="UDPモード(VTKounter方式): ワークスペース指定・パスコード認証を"
+                         "行わず /runningOrPausedCues 等を直接使う。cueLists の権限問題を"
+                         "回避したいときに")
+    ap.add_argument("--udp-reply-port", type=int, default=DEFAULT_UDP_REPLY_PORT,
+                    help="UDPモードでQLabからの応答を受けるこのPC側のポート(既定 53001)")
     ap.add_argument("--demo", action="store_true", help="内蔵ダミー QLab で動作確認")
     ap.add_argument("--gui", action="store_true", help="設定ウィンドウ付きで起動")
     ap.add_argument("--console", action="store_true", help="ウィンドウ無しで起動")
@@ -1970,13 +2060,15 @@ def main():
                   % ip.rsplit(".", 1)[0])
             print("   同じスイッチに有線で挿し、そのアダプタに %s.x を設定してください。\n"
                   % ip.rsplit(".", 1)[0])
-        ok, e = tcp_open(ip, pnum, timeout=5.0)
-        print("TCP 接続: %s" % ("OK" if ok else "NG (%s)" % e))
-        if not ok:
-            print("→ QLab が起動しているか、Workspace Settings › Network › OSC Access で")
-            print("  「Allow OSC Connections」が有効か、OSC Listening Port が %d か確認を。" % pnum)
-            return
-        for line in diagnose_workspace(ip, pnum, args.passcode, timeout=5.0):
+        if not args.udp:
+            ok, e = tcp_open(ip, pnum, timeout=5.0)
+            print("TCP 接続: %s" % ("OK" if ok else "NG (%s)" % e))
+            if not ok:
+                print("→ QLab が起動しているか、Workspace Settings › Network › OSC Access で")
+                print("  「Allow OSC Connections」が有効か、OSC Listening Port が %d か確認を。" % pnum)
+                return
+        for line in diagnose_workspace(ip, pnum, args.passcode, timeout=5.0,
+                                       udp=args.udp, udp_reply_port=args.udp_reply_port):
             print(line)
         print("\n→ この値をそのまま入力欄に入れれば使えます: %s:%d" % (ip, pnum))
         return
@@ -1991,14 +2083,15 @@ def main():
     want_gui = (args.gui or (len(sys.argv) == 1 and not args.console)) and not args.demo
     if want_gui:
         if run_gui(host, port, args.web_port) is not False:
-            return
+            return  # run_gui reads its own udp/udp-reply-port state from the saved config/checkbox
         message_box("SW QLAB MONITOR",
                     "この Python には tkinter が入っていないため、設定ウィンドウは開けません。\n"
                     "代わりにブラウザのモニター画面を開きます。")
         args.no_browser = False
 
     targets = parse_targets(host or "127.0.0.1", port)
-    mgr = DeviceManager(targets, passcode=args.passcode, source_ip=args.source)
+    mgr = DeviceManager(targets, passcode=args.passcode, source_ip=args.source,
+                        udp=args.udp, udp_reply_port=args.udp_reply_port)
     Handler.monitor = mgr
     comp = args.companion or cfg.get("companion")
     if comp:

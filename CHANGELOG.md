@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.0
+- New **UDP mode** ("UDPモード" checkbox / `--udp`, `--udp-reply-port`): an alternative
+  transport modeled directly on the open-source [VTKounter](https://github.com/Alteka/VTKounter)
+  project's QLab integration, which was confirmed working against a real show that this
+  tool's normal TCP+passcode+`cueLists` path could not read past `status=denied` on, even
+  with a passcode granted full View/Edit/Control. UDP mode skips the `/workspace/{id}/connect`
+  passcode handshake and the `cueLists` structure scan entirely, and talks to QLab with
+  unscoped addresses (`/runningOrPausedCues`, `/cue/playhead/...`, `/cue_id/{id}/...`) the
+  same way VTKounter does. This means the left-hand cue-list panel stays empty in UDP mode
+  (no structure scan), but REMAIN/ELAPSED/NOW/STATE work from the running-cue data alone.
+  Verified end-to-end (including the full `Monitor` polling loop, not just `--try`) against
+  a hand-written fake UDP QLab responder.
+
 ## 1.3.4
 - Sharpen 詳細診断/`--try`: also shows the raw `/connect` reply, and now tests both
   `cueLists` and `cueLists/shallow` separately (previously only the non-shallow one),

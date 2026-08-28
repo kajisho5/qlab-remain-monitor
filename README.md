@@ -31,6 +31,10 @@ ten meters away.
   the same mechanism the official QLab Remote app uses), no extra library required
 - **Fullscreen focus mode** (`F`) — just the numbers, nothing else
 - **Read-only**: this tool never sends GO/STOP or any other control commands
+- **UDP mode** — an alternate transport (no passcode handshake, no `cueLists` structure
+  scan) modeled on [VTKounter](https://github.com/Alteka/VTKounter)'s QLab integration,
+  for setups where the normal TCP+passcode path gets `status=denied` on `cueLists` even
+  with full permissions granted. See README.ja.md § 5.5 for details.
 
 ## Requirements
 

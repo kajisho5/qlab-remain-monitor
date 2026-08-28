@@ -98,6 +98,20 @@ Companion 側で **Custom Variables** に同名の変数を先に作っておく
   Groupキュー（入れ子含む）は展開してキュー一覧に表示する
 - SSE でブラウザに push、ブラウザ側は 60fps で自走しサーバ値へ滑らかに追従
 
+## 5.5 UDPモード（パスコード権限で詰まる場合）
+
+QLab のパスコードに View/Edit/Control を全部与えても `cueLists` が `status=denied` に
+なるケースが実際にありました。原因は特定できていませんが、オープンソースの
+[VTKounter](https://github.com/Alteka/VTKounter) は同じ問題を避けるように、
+そもそも `/workspace/{id}/connect` でのパスコード認証も `cueLists` によるキュー構造の
+取得も一切行わず、`/runningOrPausedCues` 等の無指定アドレスだけで完結させています。
+
+設定ウィンドウの **UDPモード（パスコード不要・VTKounter方式）** にチェックを入れると、
+このツールも同じ方式に切り替わります。パスコード欄は無視され、キューリストのスキャンも
+行われません（＝左側のキュー一覧パネルは空のまま）が、REMAIN/ELAPSED/NOW/STATE は
+再生中キューの情報だけで動くので、TCP+パスコード方式が通らない環境でも動く可能性が
+あります。コマンドラインからは `--udp`（応答ポートは既定53001、`--udp-reply-port`で変更可）。
+
 ## 6. 既知の制限
 
 - QLab の OSC API には映像・音声の実データが無い（波形やスコープは取得できない）
